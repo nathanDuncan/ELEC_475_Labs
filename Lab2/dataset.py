@@ -1,123 +1,98 @@
-import os
 import torch
-from torch.utils.data import Dataset
+import pandas as pd
 from PIL import Image
-import re
+import os
+import ast
+from torch.utils.data import Dataset
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF # For H-Flip
 
 class PetNoseDataset(Dataset):
     """
-    Custom PyTorch Dataset for the Oxford-IIIT Pet Nose Localization task.
+    Custom Dataset for the Pet Nose Localization task.
     
-    Reads image filenames and (x, y) coordinates from an annotation file,
-    loads images, and applies necessary transformations.
+    Handles loading images, parsing coordinates, and applying
+    transforms and augmentations.
     """
-    
-    def __init__(self, annotations_file, img_dir, transform=None):
+    def __init__(self, annotations_file, img_dir, 
+                 transform=None, use_augmentation=False):
         """
         Args:
-            annotations_file (string): Path to the .txt file with annotations.
+            annotations_file (string): Path to the csv file with annotations.
             img_dir (string): Directory with all the images.
             transform (callable, optional): Optional transform to be applied
-                on an image sample.
+                on a sample (e.g., ToTensor()).
+            use_augmentation (bool): If True, applies random augmentations.
         """
+        # --- FIX 1 ---
+        # The annotation file only has 2 columns
+        self.annotations_df = pd.read_csv(
+            annotations_file, 
+            header=None, 
+            names=['filename', 'coords_str'] 
+        )
         self.img_dir = img_dir
         self.transform = transform
-        self.annotations = []
+        self.use_augmentation = use_augmentation
         
-        # Regex to safely parse the coordinate string, e.g., "(198, 304)"
-        # It handles potential leading/trailing spaces.
-        self.coord_regex = re.compile(r'\(\s*(\d+)\s*,\s*(\d+)\s*\)')
-        
-        print(f"Loading annotations from: {annotations_file}")
-        
-        try:
-            with open(annotations_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                        
-                    parts = line.split(',', 1) # Split only on the first comma
-                    if len(parts) != 2:
-                        print(f"Warning: Skipping malformed line: {line}")
-                        continue
-                        
-                    img_name = parts[0].strip()
-                    coord_str = parts[1].strip().strip('"') # Remove quotes
-                    
-                    match = self.coord_regex.match(coord_str)
-                    if not match:
-                        print(f"Warning: Skipping line with unparsable coords: {line}")
-                        continue
-                    
-                    # Coords are read as (x, y)
-                    x_orig = int(match.group(1))
-                    y_orig = int(match.group(2))
-                    
-                    self.annotations.append((img_name, (x_orig, y_orig)))
-                    
-        except FileNotFoundError:
-            print(f"ERROR: Annotation file not found at {annotations_file}")
-            raise
-        except Exception as e:
-            print(f"ERROR: Failed to read annotations file: {e}")
-            raise
-
-        if not self.annotations:
-            print(f"ERROR: No annotations were successfully loaded from {annotations_file}.")
-            print("Please check the file path and format.")
-        else:
-            print(f"Successfully loaded {len(self.annotations)} annotations.")
+        # Define our standard and augmentation transforms
+        self.resize = transforms.Resize((227, 227))
+        self.aug_color = transforms.ColorJitter(brightness=0.3, 
+                                                contrast=0.3, 
+                                                saturation=0.3)
+        self.to_tensor = transforms.ToTensor()
 
     def __len__(self):
-        """Returns the total number of samples in the dataset."""
-        return len(self.annotations)
+        return len(self.annotations_df)
 
     def __getitem__(self, idx):
-        """
-        Fetches the sample at the given index.
-        
-        Returns:
-            tuple: (image, label) where image is the transformed image
-            tensor and label is a tensor of the scaled [x, y] coordinates.
-        """
         if torch.is_tensor(idx):
             idx = idx.tolist()
-            
-        img_name, (x_orig, y_orig) = self.annotations[idx]
-        img_path = os.path.join(self.img_dir, img_name)
-        
-        try:
-            # Open image and ensure it's in RGB format
-            image = Image.open(img_path).convert('RGB')
-        except FileNotFoundError:
-            print(f"ERROR: Image file not found at {img_path} (for annotation: {img_name})")
-            # Return a placeholder or skip? For now, re-raise.
-            raise
-        except Exception as e:
-            print(f"ERROR: Could not open image {img_path}: {e}")
-            raise
-            
-        # Get original image dimensions
-        w_orig, h_orig = image.size
-        
-        # --- Coordinate Scaling ---
-        # Scale the original coordinates to the target size (227x227)
-        # as required by the lab document.
-        # (x_new) = (x_orig) * (target_width / orig_width)
-        # (y_new) = (y_orig) * (target_height / orig_height)
-        
-        target_size = 227.0 # Use float for precision
-        x_scaled = x_orig * (target_size / w_orig)
-        y_scaled = y_orig * (target_size / h_orig)
-        
-        # Create the label tensor
-        label = torch.tensor([x_scaled, y_scaled], dtype=torch.float32)
 
-        # Apply transformations to the image
-        # The transform pipeline MUST include transforms.Resize((227, 227))
-        # and transforms.ToTensor()
-        if self.transform:
-            image = self.transform(image)
+        # 1. Load image path and metadata
+        row = self.annotations_df.iloc[idx]
+        img_name = os.path.join(self.img_dir, row['filename'])
+        image = Image.open(img_name).convert('RGB')
+        
+        # --- FIX 2 ---
+        # Get the original width and height *from the image itself*
+        # before resizing it.
+        original_w, original_h = image.size
+        
+        # 2. Parse coordinates from the string
+        # Use ast.literal_eval for safe parsing of "(x, y)" string
+        coords_tuple = ast.literal_eval(row['coords_str'].strip())
+        
+        # 3. Apply base resize to image
+        image = self.resize(image)
+        
+        # 4. Scale coordinates to the resized 227x227 space
+        # This math will now work correctly
+        scaled_x = coords_tuple[0] * (227.0 / original_w)
+        scaled_y = coords_tuple[1] * (227.0 / original_h)
+        coords = torch.tensor([scaled_x, scaled_y], dtype=torch.float32)
+
+        # 5. Apply Augmentations (if enabled)
+        if self.use_augmentation:
             
-        return image, label
+            # --- Augmentation 1: Horizontal Flip ---
+            # 50% chance to flip
+            if torch.rand(1) < 0.5:
+                image = TF.hflip(image)
+                # IMPORTANT: We must also flip the x-coordinate
+                # A 0-indexed pixel at x becomes (width - 1 - x)
+                coords[0] = 227.0 - 1.0 - coords[0]
+                
+            # --- Augmentation 2: Color Jitter ---
+            # This transform doesn't affect coordinates
+            image = self.aug_color(image)
+
+        # 6. Apply final transform (e.g., ToTensor)
+        # We must apply ToTensor *after* all PIL-based augmentations
+        if self.transform:
+            image_tensor = self.transform(image)
+        else:
+            # Fallback if no transform is provided
+            image_tensor = self.to_tensor(image)
+
+        return image_tensor, coords
