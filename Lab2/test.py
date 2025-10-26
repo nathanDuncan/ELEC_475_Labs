@@ -5,15 +5,17 @@ import torchvision.transforms as transforms
 import argparse
 import os
 import numpy as np
+from tqdm import tqdm # <-- Import tqdm
 
 # Import our custom model and dataset
 from model import SnoutNetModel
 from dataset import PetNoseDataset
 
 # --- Define Paths ---
-BASE_DATA_DIR = 'oxford-iiit-pet-noses'
-IMG_DIR = os.path.join(BASE_DATA_DIR, 'images-original', 'images')
-TEST_ANNOTATIONS = os.path.join(BASE_DATA_DIR, 'test_noses.txt')
+# We will now use the --data_dir argument
+# BASE_DATA_DIR = 'oxford-iiit-pet-noses'
+# IMG_DIR = os.path.join(BASE_DATA_DIR, 'images-original', 'images')
+# TEST_ANNOTATIONS = os.path.join(BASE_DATA_DIR, 'test_noses.txt')
 # --------------------
 
 def test(args):
@@ -23,8 +25,18 @@ def test(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # --- UPDATED PATHS ---
+    # Construct paths based on the --data_dir argument
+    IMG_DIR = os.path.join(args.data_dir, 'images-original', 'images')
+    TEST_ANNOTATIONS = os.path.join(args.data_dir, 'test_noses.txt')
+
+    if not os.path.isdir(args.data_dir):
+        print(f"Error: Data directory not found at {args.data_dir}")
+        print("Please check the --data_dir path.")
+        return
+    # ---------------------
+
     # 2. Create Test Dataset and DataLoader
-    # As before, only ToTensor is needed. NO augmentation.
     test_transform = transforms.ToTensor()
     
     test_dataset = PetNoseDataset(
@@ -37,9 +49,9 @@ def test(args):
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2
+        num_workers=args.num_workers # <-- Use arg
     )
-    print(f"Loaded test dataset: {len(test_dataset)} samples")
+    print(f"Loaded test dataset: {len(test_dataset)} samples from {args.data_dir}")
 
     # 3. Initialize Model and Load Weights
     model = SnoutNetModel().to(device)
@@ -56,28 +68,24 @@ def test(args):
         
     print(f"Successfully loaded weights from {args.weights_path}")
     
-    # Set model to evaluation mode
     model.eval()
 
     # 4. Testing Loop
     all_distances = []
     
     print("Running evaluation on test set...")
-    with torch.no_grad(): # Disable gradient calculation
-        for images, labels in test_loader:
+    # Wrap test_loader in tqdm for a progress bar
+    with torch.no_grad():
+        for images, labels in tqdm(test_loader, desc="Testing"):
             images = images.to(device)
             labels = labels.to(device)
             
-            # Forward pass: get predictions
             predictions = model(images)
             
-            # Calculate Euclidean distance for each sample in the batch
-            # L2 distance = sqrt( (x1-x2)^2 + (y1-y2)^2 )
             distances = torch.sqrt(
                 torch.sum((predictions - labels)**2, dim=1)
             )
             
-            # Add batch distances to our master list
             all_distances.extend(distances.cpu().numpy())
 
     # 5. Calculate and Print Statistics
@@ -98,14 +106,21 @@ def test(args):
 
 
 if __name__ == "__main__":
-    # Setup command-line argument parsing
     parser = argparse.ArgumentParser(description='Test SnoutNet Model')
     
+    # --- ADDED THIS ARGUMENT ---
+    parser.add_argument('--data_dir', type=str, default='oxford-iiit-pet-noses',
+                        help='Path to the base data directory')
+    # ---------------------------
+
     parser.add_argument('--weights_path', type=str, required=True,
                         help='Path to the trained .pth model weights file')
-    parser.add_widget('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=32,
                         help='Test batch size (default: 32)')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='DataLoader num_workers. (default: 0, which is safest for Colab)')
     
     args = parser.parse_args()
     
     test(args)
+

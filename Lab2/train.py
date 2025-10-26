@@ -8,17 +8,18 @@ import os
 import time
 import pandas as pd
 import matplotlib.pyplot as plt
+from tqdm import tqdm # <-- Import tqdm
 
 # Import our custom model and dataset
 from model import SnoutNetModel
 from dataset import PetNoseDataset
 
 # --- Define Paths ---
-# Assumes 'oxford-iiit-pet-noses' is in the same directory as this script
-BASE_DATA_DIR = 'oxford-iiit-pet-noses'
-IMG_DIR = os.path.join(BASE_DATA_DIR, 'images-original', 'images')
-TRAIN_ANNOTATIONS = os.path.join(BASE_DATA_DIR, 'train_noses.txt')
-TEST_ANNOTATIONS = os.path.join(BASE_DATA_DIR, 'test_noses.txt')
+# We will now use the --data_dir argument to define the base path
+# BASE_DATA_DIR = 'oxford-iiit-pet-noses' # <-- This is now an argument
+# IMG_DIR = os.path.join(BASE_DATA_DIR, 'images-original', 'images')
+# TRAIN_ANNOTATIONS = os.path.join(BASE_DATA_DIR, 'train_noses.txt')
+# TEST_ANNOTATIONS = os.path.join(BASE_DATA_DIR, 'test_noses.txt')
 # --------------------
 
 def train(args):
@@ -28,9 +29,19 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # --- UPDATED PATHS ---
+    # Construct paths based on the --data_dir argument
+    IMG_DIR = os.path.join(args.data_dir, 'images-original', 'images')
+    TRAIN_ANNOTATIONS = os.path.join(args.data_dir, 'train_noses.txt')
+    TEST_ANNOTATIONS = os.path.join(args.data_dir, 'test_noses.txt')
+    
+    if not os.path.isdir(args.data_dir):
+        print(f"Error: Data directory not found at {args.data_dir}")
+        print("Please check the --data_dir path.")
+        return
+    # ---------------------
+
     # 2. Create Datasets and DataLoaders
-    # The only transform we need to pass is ToTensor,
-    # as Resize and Augmentations are handled inside PetNoseDataset
     data_transform = transforms.ToTensor()
 
     # --- Training Dataset ---
@@ -44,14 +55,13 @@ def train(args):
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2
+        num_workers=args.num_workers # <-- Use arg
     )
-    print(f"Loaded training dataset: {len(train_dataset)} samples")
+    print(f"Loaded training dataset: {len(train_dataset)} samples from {args.data_dir}")
     aug_status = "ENABLED" if args.use_augmentation else "DISABLED"
     print(f"Augmentation: {aug_status}")
 
     # --- Validation Dataset ---
-    # IMPORTANT: Never use augmentation on the validation set!
     val_dataset = PetNoseDataset(
         annotations_file=TEST_ANNOTATIONS, # Use test set for validation
         img_dir=IMG_DIR,
@@ -61,15 +71,14 @@ def train(args):
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
-        shuffle=False, # No need to shuffle validation set
-        num_workers=2
+        shuffle=False, 
+        num_workers=args.num_workers # <-- Use arg
     )
     print(f"Loaded validation dataset: {len(val_dataset)} samples")
 
     # 3. Initialize Model, Loss, and Optimizer
     model = SnoutNetModel().to(device)
     
-    # Mean Squared Error (MSE) is a standard loss for regression tasks
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
@@ -81,35 +90,38 @@ def train(args):
     start_time = time.time()
 
     for epoch in range(args.epochs):
+        
         # --- Training Phase ---
         model.train()
         running_train_loss = 0.0
-        for images, labels in train_loader:
+        # Wrap train_loader in tqdm for a progress bar
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
+        
+        for images, labels in train_pbar:
             images = images.to(device)
             labels = labels.to(device)
 
-            # Zero gradients
             optimizer.zero_grad()
-            
-            # Forward pass
             outputs = model(images)
-            
-            # Calculate loss
             loss = criterion(outputs, labels)
-            
-            # Backward pass and optimize
             loss.backward()
             optimizer.step()
             
             running_train_loss += loss.item() * images.size(0)
+            
+            # Update the progress bar description with the current loss
+            train_pbar.set_postfix({'loss': loss.item()})
 
         epoch_train_loss = running_train_loss / len(train_loader.dataset)
 
         # --- Validation Phase ---
         model.eval()
         running_val_loss = 0.0
-        with torch.no_grad(): # Disable gradient calculation
-            for images, labels in val_loader:
+        # Wrap val_loader in tqdm for a progress bar
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]")
+        
+        with torch.no_grad():
+            for images, labels in val_pbar:
                 images = images.to(device)
                 labels = labels.to(device)
                 
@@ -117,20 +129,23 @@ def train(args):
                 loss = criterion(outputs, labels)
                 
                 running_val_loss += loss.item() * images.size(0)
+                val_pbar.set_postfix({'val_loss': loss.item()})
 
         epoch_val_loss = running_val_loss / len(val_loader.dataset)
+        
+        # We can clear the progress bars now
+        train_pbar.close()
+        val_pbar.close()
         
         # Print epoch stats
         print(f"Epoch {epoch+1}/{args.epochs} | "
               f"Train Loss: {epoch_train_loss:.6f} | "
               f"Val Loss: {epoch_val_loss:.6f}")
         
-        # Store history
         history['epoch'].append(epoch + 1)
         history['train_loss'].append(epoch_train_loss)
         history['val_loss'].append(epoch_val_loss)
 
-        # Save the best model
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
             torch.save(model.state_dict(), args.weights_name)
@@ -157,9 +172,13 @@ def train(args):
 
 
 if __name__ == "__main__":
-    # Setup command-line argument parsing
     parser = argparse.ArgumentParser(description='Train SnoutNet Model')
     
+    # --- ADDED THIS ARGUMENT ---
+    parser.add_argument('--data_dir', type=str, default='oxford-iiit-pet-noses',
+                        help='Path to the base data directory')
+    # ---------------------------
+
     parser.add_argument('--use_augmentation', action='store_true',
                         help='Enable data augmentation (flip and jitter)')
     parser.add_argument('--lr', type=float, default=1e-4,
@@ -170,6 +189,8 @@ if __name__ == "__main__":
                         help='Training batch size (default: 32)')
     parser.add_argument('--weights_name', type=str, default='snoutnet.pth',
                         help='Name to save the trained model weights')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='DataLoader num_workers. (default: 0, which is safest for Colab)')
     
     args = parser.parse_args()
     
