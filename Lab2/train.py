@@ -8,19 +8,43 @@ import os
 import time
 import pandas as pd
 import matplotlib.pyplot as plt
-from tqdm import tqdm # <-- Import tqdm
+from tqdm import tqdm 
 
-# Import our custom model and dataset
+# --- UPDATED IMPORTS ---
+# Import our custom models
 from model import SnoutNetModel
+try:
+    from pretrained_models import SnoutNetAlexNet, SnoutNetVGG
+except ImportError:
+    print("Warning: Could not import pretrained_models.py.")
+    print("Only 'snoutnet' model type will be available.")
+# -------------------------
+
 from dataset import PetNoseDataset
 
 # --- Define Paths ---
-# We will now use the --data_dir argument to define the base path
-# BASE_DATA_DIR = 'oxford-iiit-pet-noses' # <-- This is now an argument
+# We will now use the --data_dir argument
+# BASE_DATA_DIR = 'oxford-iiit-pet-noses'
 # IMG_DIR = os.path.join(BASE_DATA_DIR, 'images-original', 'images')
 # TRAIN_ANNOTATIONS = os.path.join(BASE_DATA_DIR, 'train_noses.txt')
 # TEST_ANNOTATIONS = os.path.join(BASE_DATA_DIR, 'test_noses.txt')
 # --------------------
+
+def load_model(model_name, device):
+    """Helper function to load the correct model architecture."""
+    if model_name == 'snoutnet':
+        print("Loading SnoutNetModel")
+        model = SnoutNetModel()
+    elif model_name == 'alexnet':
+        print("Loading SnoutNetAlexNet")
+        model = SnoutNetAlexNet()
+    elif model_name == 'vgg16':
+        print("Loading SnoutNetVGG")
+        model = SnoutNetVGG()
+    else:
+        raise ValueError(f"Unknown model name: {model_name}. Choose 'snoutnet', 'alexnet', or 'vgg16'")
+    
+    return model.to(device)
 
 def train(args):
     """Main training and validation loop."""
@@ -42,7 +66,20 @@ def train(args):
     # ---------------------
 
     # 2. Create Datasets and DataLoaders
-    data_transform = transforms.ToTensor()
+    # --- NORMALIZATION ---
+    # Pretrained models require inputs to be normalized in the same
+    # way as the ImageNet data they were trained on.
+    if args.model == 'snoutnet':
+        data_transform = transforms.ToTensor()
+    else:
+        # Use ImageNet mean and std
+        data_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+    print("Using transforms:", data_transform)
+    # ---------------------
 
     # --- Training Dataset ---
     train_dataset = PetNoseDataset(
@@ -55,7 +92,7 @@ def train(args):
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers # <-- Use arg
+        num_workers=args.num_workers 
     )
     print(f"Loaded training dataset: {len(train_dataset)} samples from {args.data_dir}")
     aug_status = "ENABLED" if args.use_augmentation else "DISABLED"
@@ -65,28 +102,47 @@ def train(args):
     val_dataset = PetNoseDataset(
         annotations_file=TEST_ANNOTATIONS, # Use test set for validation
         img_dir=IMG_DIR,
-        transform=data_transform,
+        transform=data_transform, # Must use same transform!
         use_augmentation=False 
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False, 
-        num_workers=args.num_workers # <-- Use arg
+        num_workers=args.num_workers
     )
     print(f"Loaded validation dataset: {len(val_dataset)} samples")
 
     # 3. Initialize Model, Loss, and Optimizer
-    model = SnoutNetModel().to(device)
+    # --- UPDATED MODEL LOADING ---
+    try:
+        model = load_model(args.model, device)
+    except NameError:
+        print("ERROR: 'pretrained_models' not found. Make sure pretrained_models.py exists.")
+        return
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return
+    # ---------------------------
     
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
+    # --- UPDATED OPTIMIZER ---
+    # We only want to optimize the parameters of the new classifier
+    # (or all params for snoutnet)
+    if args.model == 'snoutnet':
+        print("Optimizing all parameters for SnoutNet")
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    else:
+        print("Optimizing only CLASSIFIER parameters for fine-tuning")
+        optimizer = optim.Adam(model.classifier.parameters(), lr=args.lr)
+    # -------------------------
+
     # 4. Training Loop
     best_val_loss = float('inf')
     history = {'epoch': [], 'train_loss': [], 'val_loss': []}
 
-    print(f"\n--- Starting Training for {args.epochs} epochs ---")
+    print(f"\n--- Starting Training for {args.epochs} epochs ({args.model}) ---")
     start_time = time.time()
 
     for epoch in range(args.epochs):
@@ -94,7 +150,6 @@ def train(args):
         # --- Training Phase ---
         model.train()
         running_train_loss = 0.0
-        # Wrap train_loader in tqdm for a progress bar
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
         
         for images, labels in train_pbar:
@@ -108,8 +163,6 @@ def train(args):
             optimizer.step()
             
             running_train_loss += loss.item() * images.size(0)
-            
-            # Update the progress bar description with the current loss
             train_pbar.set_postfix({'loss': loss.item()})
 
         epoch_train_loss = running_train_loss / len(train_loader.dataset)
@@ -117,7 +170,6 @@ def train(args):
         # --- Validation Phase ---
         model.eval()
         running_val_loss = 0.0
-        # Wrap val_loader in tqdm for a progress bar
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]")
         
         with torch.no_grad():
@@ -133,11 +185,9 @@ def train(args):
 
         epoch_val_loss = running_val_loss / len(val_loader.dataset)
         
-        # We can clear the progress bars now
         train_pbar.close()
         val_pbar.close()
         
-        # Print epoch stats
         print(f"Epoch {epoch+1}/{args.epochs} | "
               f"Train Loss: {epoch_train_loss:.6f} | "
               f"Val Loss: {epoch_val_loss:.6f}")
@@ -162,7 +212,7 @@ def train(args):
     plt.figure(figsize=(10, 5))
     plt.plot(history_df['epoch'], history_df['train_loss'], label='Train Loss')
     plt.plot(history_df['epoch'], history_df['val_loss'], label='Validation Loss')
-    plt.title(f"Training and Validation Loss (Augmentation: {aug_status})")
+    plt.title(f"Training and Validation Loss ({args.model}, Aug: {aug_status})")
     plt.xlabel('Epoch')
     plt.ylabel('MSE Loss')
     plt.legend()
@@ -175,10 +225,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train SnoutNet Model')
     
     # --- ADDED THIS ARGUMENT ---
-    parser.add_argument('--data_dir', type=str, default='oxford-iiit-pet-noses',
-                        help='Path to the base data directory')
+    parser.add_argument('--model', type=str, default='snoutnet',
+                        help="Model to train. Choose 'snoutnet', 'alexnet', or 'vgg16'")
     # ---------------------------
 
+    parser.add_argument('--data_dir', type=str, default='oxford-iiit-pet-noses',
+                        help='Path to the base data directory')
     parser.add_argument('--use_augmentation', action='store_true',
                         help='Enable data augmentation (flip and jitter)')
     parser.add_argument('--lr', type=float, default=1e-4,
@@ -195,3 +247,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     train(args)
+
